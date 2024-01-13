@@ -3,134 +3,230 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
-from torch.utils.data.sampler import SubsetRandomSampler
 
 import torchvision
 import torchvision.transforms as transforms
 
-import os
+import os, time
 import argparse
-import random
 
 from models import *
 from utils import progress_bar
-from loader import Loader, Loader2, Loader_Cold
+from loader import Loader_Cold
+from sklearn.metrics import precision_score, recall_score, f1_score  # For precision and recall
+import pandas as pd
 
-parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
-parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--resume', '-r', action='store_true',
-                    help='resume from checkpoint')
-args = parser.parse_args()
+import numpy as np
+
+from auto_augment import RandAugmentPolicy
+
+from torch.optim.swa_utils import AveragedModel, SWALR
+from helper_methods import select_samples, count_folders
+
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-best_acc = 0  # best test accuracy
-start_epoch = 0  # start from epoch 0 or last checkpoint epoch
+import argparse
 
-# Data
-print('==> Preparing data..')
-transform_train = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
+parser.add_argument('--DATASET_NAME', required=True, help='Name of the dataset')
+parser.add_argument('--run_random', action='store_true', default=False, help='Run in random mode')
+parser.add_argument('--sort_order', type=int, default=-1, help='Sort order (default: -1)')
 
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+args = parser.parse_args()
 
-trainset = Loader_Cold(is_train=True, transform=transform_train)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
+# Check if run_random is False, then sort_number must be provided
+if not args.run_random and args.sort_order == -1:
+    parser.error("--sort_order is required when --run_random is False")
 
-testset = Loader_Cold(is_train=False, transform=transform_test)
-testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
+# Now you can use args.DATASET_NAME, args.run_random, and args.sort_number in your code
+dataset_name = args.DATASET_NAME
+run_random = args.run_random
+sort_order = args.sort_order
 
-classes = ('plane', 'car', 'bird', 'cat', 'deer',
-           'dog', 'frog', 'horse', 'ship', 'truck')
+list_of_num_samples = [1000, 2000, 4000, 5000, 6000, 8000, 10000]
+sort_methods = {
+    -1: "Random",
+    0: "Loss_Confusion_Classes_Sort",
+    1: "Uncertainty_Confusion_Classes_Sort",
+    2: "Loss_Sort",
+    3: "Uncertainty_Sort"
+}
+total_epochs = 200
+swa_start = int(0.75 * total_epochs)
+total_experiments = 3
+num_classes = count_folders(dataset_name=dataset_name)
 
-# Model
-print('==> Building model..')
-net = ResNet18()
-net = net.to(device)
+def run_experiment(num_exps, run_random=False):
+    output_result = [] # Save all results
+    data_result = [] # Save result for each round of data sample selected
+    output_file_name = f'output_{dataset_name}_{sort_methods[sort_order]}.csv'
 
-if device == 'cuda':
-    net = torch.nn.DataParallel(net)
-    cudnn.benchmark = True
+    for _ in range(num_exps):
+        for num_samples in list_of_num_samples:
 
-if args.resume:
-    # Load checkpoint.
-    print('==> Resuming from checkpoint..')
-    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-    checkpoint = torch.load('./checkpoint/ckpt.pth')
-    net.load_state_dict(checkpoint['net'])
-    best_acc = checkpoint['acc']
-    start_epoch = checkpoint['epoch']
+            # Data
+            print('==> Preparing data..')
+            transform_train = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                RandAugmentPolicy(N=1,M=5),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            ])
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=0.1,momentum=0.9, weight_decay=5e-4)
-scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[160])
+            transform_test = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            ])
 
-# Training
-def train(epoch):
-    print('\nEpoch: %d' % epoch)
-    net.train()
-    train_loss = 0
-    correct = 0
-    total = 0
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad()
-        outputs = net(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
+            train_data_list = select_samples(dataset_name=dataset_name, select_random=run_random, sort_method=sort_order, number_of_samples=num_samples)
+            trainset = Loader_Cold(is_train=True, transform=transform_train, dataset_name=dataset_name, data_list=train_data_list)
+            trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
 
-        train_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
+            testset = Loader_Cold(is_train=False, transform=transform_test, dataset_name=dataset_name)
+            testloader = torch.utils.data.DataLoader(testset, batch_size=128, shuffle=False, num_workers=2)
 
-        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+            # Model
+            print('==> Building model..')
+            net = ResNet18(num_classes=num_classes)
+            net = net.to(device)
+
+            if device == 'cuda':
+                net = torch.nn.DataParallel(net)
+                cudnn.benchmark = True
+
+            swa_model = AveragedModel(net)
+
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.SGD(net.parameters(), lr=0.1,momentum=0.9, weight_decay=5e-4)
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[160])
+            swa_scheduler = SWALR(optimizer, swa_lr=0.05)
+
+            # Training
+            def train(epoch):
+                print('\nEpoch: %d' % epoch)
+
+                net.train()
+                train_loss = 0
+                correct = 0
+                total = 0
+
+                train_preds = []
+                train_targets = []
+
+                for batch_idx, (inputs, targets) in enumerate(trainloader):
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    optimizer.zero_grad()
+                    outputs = net(inputs)
+                    loss = criterion(outputs, targets)
+                    loss.backward()
+                    optimizer.step()
+
+                    train_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    total += targets.size(0)
+                    correct += predicted.eq(targets).sum().item()
+
+                    progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                                % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+                    
+                    # Accumulate predictions and targets during training
+                    train_preds.extend(predicted.cpu().numpy())
+                    train_targets.extend(targets.cpu().numpy())
+
+                    if epoch > swa_start:
+                        swa_model.update_parameters(net)
+                        swa_scheduler.step()
+                    
+                return (train_loss/(batch_idx+1)), 100.*correct/total, train_preds, train_targets
+
+            def test_swa_model():
+                torch.optim.swa_utils.update_bn(trainloader, swa_model)
+                swa_model.eval()
+                test_loss = 0
+                correct = 0
+                total = 0
+                test_preds = []
+                test_targets = []
+                batch_idx = 0
+
+                with torch.no_grad():
+                    for batch_idx, (inputs, targets) in enumerate(testloader):
+                        inputs, targets = inputs.to(device), targets.to(device)
+                        outputs = swa_model(inputs)
+                        loss = criterion(outputs, targets)
+
+                        test_loss += loss.item()
+                        _, predicted = outputs.max(1)
+                        total += targets.size(0)
+                        correct += predicted.eq(targets).sum().item()
+
+                        progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                                    % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
+                        
+                        # Accumulate predictions and targets during training
+                        test_preds.extend(predicted.cpu().numpy())
+                        test_targets.extend(targets.cpu().numpy())
+                    
+
+                # Save checkpoint.
+                acc = 100. * correct / total if total != 0 else 0
+                print('Saving..')
+                state = {
+                    'net': net.state_dict(),
+                    'acc': acc,
+                    'epoch': epoch,
+                }
+                if not os.path.isdir('checkpoint'):
+                    os.mkdir('checkpoint')
+                torch.save(state, './checkpoint/ckpt.pth')
+                return (test_loss/(batch_idx+1)), acc, test_preds, test_targets
+
+            start_time = time.time()
+            for epoch in range(0, total_epochs):
+                train_loss, train_acc, train_preds, train_targets = train(epoch)
+                scheduler.step()
+
+            test_loss, test_acc, test_preds, test_targets = test_swa_model()
+
+            train_prec = precision_score(train_targets, train_preds, average='macro')
+            train_recall = recall_score(train_targets, train_preds, average='macro')
+
+            test_prec = precision_score(test_targets, test_preds, average='macro')
+            test_recall = recall_score(test_targets, test_preds, average='macro')
+
+            # Compute F1 scores
+            f1_train = f1_score(train_targets, train_preds, average='macro')
+            f1_test = f1_score(test_targets, test_preds, average='macro')
+
+            data_result = [num_samples, train_loss, train_acc, train_prec, train_recall, f1_train, test_loss, test_acc, test_prec, test_recall, f1_test, epoch]
+            output_result.append(data_result)
+
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            print(f"Time taken: {elapsed_time} seconds for {num_samples} samples to run {total_epochs} epochs")
+
+            column_headers = [
+                'num_samples',
+                'train_loss',
+                'train_acc',
+                'train_prec',
+                'train_recall',
+                'f1_train',
+                'test_loss',
+                'test_acc',
+                'test_prec',
+                'test_recall',
+                'f1_test',
+                'epoch'
+            ]
+
+            # Create a DataFrame
+            df = pd.DataFrame(output_result, columns = column_headers)
+
+            # Save the DataFrame to a CSV file
+            df.to_csv(output_file_name, index=False,  mode='w') 
+    print(output_result)
 
 
-def test(epoch):
-    global best_acc
-    net.eval()
-    test_loss = 0
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(testloader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = net(inputs)
-            loss = criterion(outputs, targets)
-
-            test_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
-
-            progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
-
-    # Save checkpoint.
-    acc = 100.*correct/total
-    if acc > best_acc:
-        print('Saving..')
-        state = {
-            'net': net.state_dict(),
-            'acc': acc,
-            'epoch': epoch,
-        }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/ckpt.pth')
-        best_acc = acc
-
-
-for epoch in range(start_epoch, start_epoch+200):
-    train(epoch)
-    test(epoch)
-    scheduler.step()
+run_experiment(total_experiments, run_random=run_random)

@@ -11,11 +11,15 @@ import torchvision.transforms as transforms
 import os
 import argparse
 import random
+import optuna
 
 from models import *
 from loader import Loader, RotationLoader
 from utils import progress_bar
 import numpy as np
+
+from auto_augment import RandAugmentPolicy, SplitAugmentPolicy
+from torch.optim.swa_utils import AveragedModel, SWALR
 
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
@@ -28,46 +32,83 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 
-# Data
-print('==> Preparing data..')
-transform_train = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+def get_train_and_test_data():
+    # Data
+    print('==> Preparing data..')
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        RandAugmentPolicy(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
 
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
 
-trainset = RotationLoader(is_train=True, transform=transform_test)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=256, shuffle=True, num_workers=2)
+    trainset = RotationLoader(is_train=True, transform=transform_train)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=256, shuffle=True, num_workers=2)
 
-testset = RotationLoader(is_train=False,  transform=transform_test)
-testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
+    testset = RotationLoader(is_train=False,  transform=transform_test)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
 
-classes = ('plane', 'car', 'bird', 'cat', 'deer',
-           'dog', 'frog', 'horse', 'ship', 'truck')
+    return trainloader, testloader
 
-# Model
-print('==> Building model..')
-net = ResNet18()
-net.linear = nn.Linear(512, 4)
-net = net.to(device)
+def build_model(device):
+    net = ResNet18()
+    net.linear = nn.Linear(512, 4)
+    net = net.to(device)
 
+    if device == 'cuda':
+        net = torch.nn.DataParallel(net)
+        cudnn.benchmark = True
 
-if device == 'cuda':
-    net = torch.nn.DataParallel(net)
-    cudnn.benchmark = True
+    return net
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
-scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60, 90])
+def train_model(net, optimizer, criterion, device, train_epochs, swa_epochs):
+
+    train_acc, test_acc, best_acc = 0, 0, 0
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60, 90])
+
+    trainloader, testloader = get_train_and_test_data()
+
+    for epoch in range(train_epochs):
+        train_acc = train_epoch(net, trainloader, criterion, optimizer, epoch, device)
+        test_acc = test_epoch(net, testloader, criterion, epoch, device, best_acc) 
+
+        if test_acc > best_acc:
+            best_acc = test_acc
+
+        scheduler.step()
+
+    swa_model = AveragedModel(net)
+    swa_start = 5
+    swa_scheduler = SWALR(optimizer, swa_lr=0.05)
+
+    for epoch in range(swa_epochs):
+        train_acc = train_epoch(net, trainloader, criterion, optimizer, epoch, device)
+        # test_acc = test_epoch(net, testloader, criterion, epoch, device, best_acc) 
+
+        # if test_acc > best_acc:
+        #     best_acc = test_acc
+
+        if epoch > swa_start:
+            swa_model.update_parameters(net)
+            swa_scheduler.step()
+        else:
+            scheduler.step()
+
+    # Update bn statistics for the swa_model at the end
+    torch.optim.swa_utils.update_bn(trainloader, swa_model)
+
+    test_acc = test_epoch(swa_model, testloader, criterion, epoch, device, 0) 
+
+    return train_acc, test_acc
 
 # Training
-def train(epoch):
+def train_epoch(net, trainloader, criterion, optimizer, epoch, device):
     print('\nEpoch: %d' % epoch)
     net.train()
     train_loss = 0
@@ -101,10 +142,12 @@ def train(epoch):
 
         progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
                      % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        
+    return 100.*correct/total
 
 
-def test(epoch):
-    global best_acc
+def test_epoch(net, testloader, criterion, epoch, device, best_acc):
+    # global best_acc
     net.eval()
     test_loss = 0
     correct = 0
@@ -154,8 +197,70 @@ def test(epoch):
         torch.save(state, './checkpoint/rotation.pth')
         best_acc = acc
 
+    return best_acc
 
-for epoch in range(start_epoch, start_epoch+15):
-    train(epoch)
-    test(epoch)
-    scheduler.step()
+
+def objective(trial, device, automl_epochs, swa_epochs):
+
+    net = build_model(device)
+    criterion = nn.CrossEntropyLoss()
+
+    lr, wd, momentum, optimizer = suggest_hyperparams(trial)
+
+    if optimizer == "ADAM":
+        optimizer = optim.Adam(net.parameters(), lr=lr, weight_decay=wd)
+    else:
+        optimizer = optim.SGD(net.parameters(), lr=lr, weight_decay=wd, momentum=momentum)
+
+    _, test_acc = train_model(net, optimizer, criterion, device, automl_epochs, swa_epochs)
+    return test_acc
+
+
+def suggest_hyperparams(trial):
+
+    # auto-ml hyperparams
+    lr = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+    wd = trial.suggest_float("weight_decay", 1e-8, 1e-3, log=True)
+    momentum = trial.suggest_float("momentum", 0.5, 1.5, log=True)
+    optimizer = trial.suggest_categorical("optimizer", ["ADAM", "SGD"])
+
+    return lr, wd, momentum, optimizer
+
+# AUTO_ML_ROUNDS = 5
+
+# study = optuna.create_study(
+#             sampler=optuna.samplers.TPESampler(),
+#             direction="maximize",
+#             pruner=optuna.pruners.SuccessiveHalvingPruner(),
+#         )
+
+
+# criterion = nn.CrossEntropyLoss()
+# automl_epochs = 2
+# swa_epochs = 13
+
+# study.optimize(
+#         lambda trial: objective(trial, device, automl_epochs, swa_epochs),
+#         n_trials=5,
+#         n_jobs=1,
+#     )
+    
+# complete_trials = [
+#         t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
+#         ]
+# print("Study statistics: ")
+# print("  Number of finished trials: ", len(study.trials))
+# print("  Number of complete trials: ", len(complete_trials))
+
+# print("Best trial:")
+# trial = study.best_trial
+
+# print("  Value: {}".format(trial.value))
+
+# print("  Params: ")
+# for key, value in trial.params.items():
+#     print("    {}: {}".format(key, value))
+
+#1. Run the SWA on all the trials.
+# train_model(net, optimizer, criterion, device, epochs)
+
